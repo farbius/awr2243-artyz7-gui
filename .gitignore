@@ -1,0 +1,13 @@
+# environment and build artifacts
+.venv/
+__pycache__/
+*.pyc
+
+# runtime output of the GUI
+logs/
+.studio_tmp/
+radar_doa_gui_settings.json
+
+# camera footage must never be stored (live view only)
+*.mp4
+*.avi

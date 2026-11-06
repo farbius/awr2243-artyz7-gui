@@ -1,0 +1,6 @@
+* text=auto
+*.bin binary
+*.so binary
+*.dtbo binary
+*.npz binary
+*.npy binary

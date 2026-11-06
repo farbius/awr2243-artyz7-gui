@@ -1,0 +1,9 @@
+# Host (Windows laptop, Python 3.13). Board side needs only python3 + numpy (preinstalled).
+numpy==2.5.4
+scipy==1.18.1
+PySide6==6.12.0
+pyqtgraph==0.14.0
+opencv-python==5.0.0.93
+paramiko==5.1.0
+pythonnet==3.2.1
+pytest==9.2.0
