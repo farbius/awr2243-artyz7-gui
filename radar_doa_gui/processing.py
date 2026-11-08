@@ -33,6 +33,8 @@ ANGLE_FFT = 64
 RA_ANGLES_DEG = np.linspace(-90.0, 90.0, 181)
 _SIN_GRID = 2.0 * np.fft.fftshift(np.fft.fftfreq(ANGLE_FFT))     # -1 .. +1 (exclusive)
 DB_FLOOR = -60.0
+ADC_FULL_SCALE = 32768.0     # 16-bit ADC: 0 dBFS = complex tone with I and Q amplitude 2^15
+DBFS_FLOOR = -200.0
 
 
 @dataclass
@@ -43,6 +45,7 @@ class ProcOptions:
     fb_averaging: bool = True
     diag_loading: float = 1e-3          # fraction of tr(R)/8 added to the diagonal
     dc_guard_bins: int = 3              # bins near DC excluded from the target search
+    fixed_range_m: float | None = None  # locked range gate: use this range bin, no search
     tdm_phase_comp: bool = True
     ddm_tx2_sign: int = -1              # observed TX2 Doppler offset (AWR2243BOOST, measured)
     flip_array: bool = False
@@ -54,7 +57,7 @@ class ProcOptions:
 class ProcResult:
     frame_id: int
     range_m: np.ndarray                 # display range axis
-    range_profile_db: np.ndarray        # [4 rx, range]
+    range_profile_db: np.ndarray        # [4 rx, range], middle chirp, raw (no clutter removal), dBFS
     ra_map_db: np.ndarray               # [range, RA_ANGLES_DEG]
     target_bin: int
     target_range_m: float
@@ -80,9 +83,9 @@ def parse_adc(raw, num_chirps: int, num_samples: int) -> np.ndarray:
     return np.ascontiguousarray(x.transpose(0, 2, 1)).astype(np.complex64)
 
 
-def to_db(power, ref=None):
+def to_db(power, ref=None, floor=DB_FLOOR):
     ref = np.max(power) if ref is None else ref
-    return np.maximum(10 * np.log10(np.maximum(power, 1e-30) / max(ref, 1e-30)), DB_FLOOR).astype(np.float32)
+    return np.maximum(10 * np.log10(np.maximum(power, 1e-30) / max(ref, 1e-30)), floor).astype(np.float32)
 
 
 def fb_average(r):
@@ -121,7 +124,13 @@ class Processor:
         self.range_axis = np.arange(n) * cfg.range_bin_m
         self.n_display = int(max(2, min(np.searchsorted(self.range_axis, cfg.display_range_m, "right"),
                                         int(0.9 * n))))
+        self.fixed_bin = None
+        if opts.fixed_range_m is not None:
+            self.fixed_bin = int(np.clip(round(opts.fixed_range_m / cfg.range_bin_m), 0, self.n_display - 1))
         self.win_range = np.hanning(n).astype(np.float32)
+        # Range-FFT power of a full-scale complex tone, window coherent gain included, so a
+        # peak in the profile reads the tone level at the ADC input in dBFS.
+        self.dbfs_ref = float((ADC_FULL_SCALE * self.win_range.sum(dtype=np.float64)) ** 2)
         nd = cfg.doppler_bins
         self.win_doppler = np.hanning(nd).astype(np.float32)
         self.window = deque(maxlen=max(1, opts.k_frames))
@@ -136,6 +145,12 @@ class Processor:
         x = adc - adc.mean(axis=-1, keepdims=True)
         return np.fft.fft(x * self.win_range, axis=-1)
 
+    @staticmethod
+    def _middle_chirp_profile(rng):
+        """Range power [rx, bin] of the middle chirp of the frame, before clutter removal and
+        calibration, so it shows the signal level at the ADC (TDM: TX0 when N/2 is even)."""
+        return np.abs(rng[rng.shape[0] // 2]) ** 2
+
     def _channel_fix(self, v, axis):
         """Apply calibration and optional flip along the virtual-channel axis."""
         if self.opts.calibration is not None:
@@ -147,6 +162,8 @@ class Processor:
         return v
 
     def _target_bin(self, power):
+        if self.fixed_bin is not None:
+            return self.fixed_bin
         g = min(self.opts.dc_guard_bins, self.n_display - 1)
         return g + int(np.argmax(power[g:self.n_display]))
 
@@ -154,10 +171,10 @@ class Processor:
     def _tdm(self, adc):
         cfg, o = self.cfg, self.opts
         rng = self._range_fft(adc)                                    # [chirp, rx, bin]
+        profile = self._middle_chirp_profile(rng)
         virt = rng.reshape(cfg.loops, 2, NUM_RX, -1).reshape(cfg.loops, NUM_VIRT, -1)
         if o.clutter_removal:
             virt = virt - virt.mean(axis=0, keepdims=True)
-        profile = (np.abs(virt.reshape(cfg.loops, 2, NUM_RX, -1)) ** 2).mean(axis=(0, 1))
         virt = self._channel_fix(virt, axis=1)
         power = (np.abs(virt) ** 2).mean(axis=(0, 1))
         tb = self._target_bin(power)
@@ -186,12 +203,12 @@ class Processor:
         cfg, o = self.cfg, self.opts
         nc = cfg.request.chirps_per_frame
         rng = self._range_fft(adc)                                    # [chirp, rx, bin]
+        profile = self._middle_chirp_profile(rng)
         m = np.arange(nc)
         code = np.exp(1j * o.ddm_tx2_sign * np.pi / 2 * m).astype(np.complex64)[:, None, None]
         if o.clutter_removal:
             rng = rng - rng.mean(axis=0, keepdims=True)                              # static TX0
             rng = rng - (rng * code.conj()).mean(axis=0, keepdims=True) * code       # static TX2
-        profile = (np.abs(rng) ** 2).mean(axis=0)
         y = np.fft.fft(rng * self.win_doppler[:, None, None], axis=0)             # [doppler, rx, bin]
         p = (np.abs(y) ** 2).sum(axis=1)                                          # [doppler, bin]
         q = o.ddm_tx2_sign * nc // 4
@@ -227,7 +244,7 @@ class Processor:
         nd = self.n_display
         return ProcResult(
             frame_id=frame_id, range_m=self.range_axis[:nd],
-            range_profile_db=to_db(profile[:, :nd]), ra_map_db=to_db(ra),
+            range_profile_db=to_db(profile[:, :nd], self.dbfs_ref, DBFS_FLOOR), ra_map_db=to_db(ra),
             target_bin=tb, target_range_m=float(self.range_axis[tb]), doppler_bin=kd,
             velocity_mps=float(vel), snapshot=snap.astype(np.complex64), covariance=cov,
             snapshots_in_window=total, frames_in_window=len(self.window),

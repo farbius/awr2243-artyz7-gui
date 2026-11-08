@@ -9,6 +9,7 @@ import logging
 import queue
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 
@@ -248,6 +249,61 @@ class SimSource:
 
     def stop(self):
         self.remaining = 0
+
+
+class VideoRecorder:
+    """Writes GUI frames (BGR uint8) to an MP4 on a background thread, in real time.
+
+    Frames come from the GUI thread with their capture time; a frame is repeated when grabs
+    fall behind, so the video plays at wall-clock speed. A full queue drops the new grab.
+    The caller must hand in frames with the camera panel already blanked.
+    """
+
+    def __init__(self, path, fps, width, height):
+        import cv2
+        self._cv2 = cv2
+        self.path, self.fps = Path(path), float(fps)
+        self.size = (width - width % 2, height - height % 2)     # even sizes for the codec
+        self._w = cv2.VideoWriter(str(self.path), cv2.VideoWriter_fourcc(*"mp4v"), self.fps, self.size)
+        if not self._w.isOpened():
+            raise RuntimeError(f"cannot open video writer for {self.path}")
+        self.written = self.dropped = 0
+        self.t0 = None
+        self._q = queue.Queue(maxsize=int(2 * self.fps) + 1)
+        self._t = threading.Thread(target=self._loop, name="video", daemon=True)
+        self._t.start()
+
+    @property
+    def duration_s(self):
+        return 0.0 if self.t0 is None else time.perf_counter() - self.t0
+
+    def add(self, frame):
+        now = time.perf_counter()
+        if self.t0 is None:
+            self.t0 = now
+        try:
+            self._q.put_nowait((frame, now))
+        except queue.Full:
+            self.dropped += 1
+
+    def _loop(self):
+        while True:
+            item = self._q.get()
+            if item is None:
+                break
+            frame, t = item
+            w, h = self.size
+            if frame.shape[1] != w or frame.shape[0] != h:          # window resized while recording
+                frame = self._cv2.resize(frame, (w, h), interpolation=self._cv2.INTER_AREA)
+            target = int((t - self.t0) * self.fps) + 1
+            while self.written < target:
+                self._w.write(frame)
+                self.written += 1
+
+    def close(self):
+        self._q.put(None)
+        self._t.join(timeout=30)
+        self._w.release()
 
 
 class CameraWorker:

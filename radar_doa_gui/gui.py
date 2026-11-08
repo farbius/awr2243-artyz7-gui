@@ -10,13 +10,14 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from . import ROOT
 from . import params as P
 from .mock_board import MockBoard
 from .processing import RA_ANGLES_DEG, ProcOptions, Processor, parse_adc
 from .protocol import THETA_DEG
 from .settings import Settings
 from .sim import RadarSimulator, Target
-from .workers import CameraWorker, Pipeline, SimSource
+from .workers import CameraWorker, Pipeline, SimSource, VideoRecorder
 
 log = logging.getLogger(__name__)
 pg.setConfigOptions(imageAxisOrder="row-major", antialias=True)
@@ -24,7 +25,6 @@ pg.setConfigOptions(imageAxisOrder="row-major", antialias=True)
 SPEC_COLORS = dict(bartlett="#2a78d6", music="#eb6834", capon="#8a3ffc")
 RX_COLORS = ("#2a78d6", "#eb6834", "#1f9d55", "#8a3ffc")
 ESPRIT_COLOR = "#1f9d55"
-DB_FLOOR = -50.0
 
 
 def load_calibration(path):
@@ -80,6 +80,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timer.start()
         self.report_timer = QtCore.QTimer(self, interval=1000, timeout=self._update_report)
         self.report_timer.start()
+        self.recorder = None
+        self.rec_timer = QtCore.QTimer(self, timeout=self._record_frame)
         self._snapshot_path = snapshot
         if snapshot:
             QtCore.QTimer.singleShot(200, self.configure)      # _on_configured starts + snapshots
@@ -107,7 +109,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.p_spec.setLabel("bottom", "Azimuth", "deg")
         self.p_spec.setLabel("left", "Normalized power", "dB")
         self.p_spec.setXRange(-90, 90)
-        self.p_spec.setYRange(DB_FLOOR, 2)
         self.p_spec.showGrid(x=True, y=True, alpha=0.3)
         self.p_spec.addLegend(offset=(-10, 10))
         self.curves = {n: self.p_spec.plot([], [], pen=pg.mkPen(c, width=2), name=n.capitalize())
@@ -122,9 +123,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.esprit_lines.append(line)
         self.p_spec.plot([], [], pen=pg.mkPen(ESPRIT_COLOR, width=2, style=QtCore.Qt.DashLine), name="ESPRIT")
 
-        self.p_rng = self.canvas.addPlot(row=1, col=0, title="Range profile")
+        self.p_rng = self.canvas.addPlot(row=1, col=0, title="Range profile (middle chirp, raw ADC)")
         self.p_rng.setLabel("bottom", "Range", "m")
-        self.p_rng.setLabel("left", "Power", "dB")
+        self.p_rng.setLabel("left", "Power", "dBFS")
         self.p_rng.showGrid(x=True, y=True, alpha=0.3)
         self.p_rng.addLegend(offset=(-10, 10))
         self.rx_curves = [self.p_rng.plot([], [], pen=pg.mkPen(c, width=1.5), name=f"RX{i}")
@@ -142,6 +143,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.p_cam.addItem(self.img_cam)
         self.cam_text = pg.TextItem("no camera", color="w", anchor=(0.5, 0.5))
         self.p_cam.addItem(self.cam_text)
+        self.cam_roi = None              # pg.RectROI while the camera ROI is being edited
+        self._cam_full_shape = None      # shape of the last full camera frame
+        self._cam_shape = None           # shape of the last displayed (possibly cropped) frame
         lay = self.canvas.ci.layout
         for i in range(2):
             lay.setColumnStretchFactor(i, 1)
@@ -172,13 +176,38 @@ class MainWindow(QtWidgets.QMainWindow):
         self.f["clutter_removal"] = self._check(form2, "Static clutter removal")
         self.f["flip_array"] = self._check(form2, "Flip array (mirror angles)")
         self.f["ip_latency_us"] = self._dspin(1, 100000, 50, 0, form2, "IP-core latency [us]")
+        self.f["dc_guard_bins"] = self._ispin(0, 64, form2, "Min target bin (DC guard)")
+        self.f["range_gate_locked"] = self._check(form2, "Lock range gate")
+        self.f["range_gate_m"] = self._dspin(0, 500, 0.1, 2, form2, "Gate range [m]")
+        self.btn_lock = QtWidgets.QPushButton("Lock at current target")
+        self.btn_lock.setToolTip("Lock the covariance range bin to the bin chosen in the latest frame")
+        self.btn_lock.clicked.connect(self._lock_current)
+        form2.addRow(self.btn_lock)
         for key in ("k_frames", "num_sources", "snapshot_mode", "fb_averaging", "diag_loading",
-                    "clutter_removal", "flip_array", "ip_latency_us"):
+                    "clutter_removal", "flip_array", "ip_latency_us", "dc_guard_bins",
+                    "range_gate_locked", "range_gate_m"):
             self._on_change(self.f[key], self._apply_processing)
         for key in ("range_res_m", "max_range_m", "display_range_m", "mode", "chirps_per_frame",
                     "tx_backoff_db", "extended_band"):
             self._on_change(self.f[key], self._radar_changed)
         bottom.addWidget(proc)
+
+        disp = QtWidgets.QGroupBox("Display (applied immediately)")
+        form4 = QtWidgets.QFormLayout(disp)
+        self.f["spectrum_floor_db"] = self._dspin(-200, -1, 5, 0, form4, "Spectrum min [dB]")
+        self.f["range_floor_dbfs"] = self._dspin(-200, -1, 5, 0, form4, "Range profile min [dBFS]")
+        for key in ("spectrum_floor_db", "range_floor_dbfs"):
+            self._on_change(self.f[key], self._apply_display)
+        self.f["camera_roi_enabled"] = self._check(form4, "Camera ROI (crop)")
+        self._on_change(self.f["camera_roi_enabled"], self._apply_display)
+        self.btn_roi = QtWidgets.QPushButton("Edit camera ROI", checkable=True)
+        self.btn_roi.setToolTip("Drag / resize the rectangle on the full camera image, "
+                                "then press again to apply")
+        self.btn_roi.toggled.connect(self._edit_roi)
+        form4.addRow(self.btn_roi)
+        self.roi_label = QtWidgets.QLabel("")
+        form4.addRow("ROI [x, y, w, h]", self.roi_label)
+        bottom.addWidget(disp)
 
         ctl = QtWidgets.QGroupBox("Control")
         cv = QtWidgets.QVBoxLayout(ctl)
@@ -196,6 +225,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_single.clicked.connect(self.single)
         for b in (self.btn_cfg, self.btn_run, self.btn_single):
             cv.addWidget(b)
+        self.btn_rec = QtWidgets.QPushButton("Record GUI video", checkable=True)
+        self.btn_rec.setToolTip("MP4 of the window + report text in recordings/ "
+                                "(the camera panel is blanked: camera frames are never stored)")
+        self.btn_rec.toggled.connect(self._toggle_recording)
+        cv.addWidget(self.btn_rec)
         row = QtWidgets.QHBoxLayout()
         b_save, b_load = QtWidgets.QPushButton("Save settings"), QtWidgets.QPushButton("Load settings")
         b_save.clicked.connect(self._save_settings)
@@ -264,6 +298,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 w.setValue(val)
             w.blockSignals(False)
         self._check_k()
+        self._apply_display()
 
     def _read_fields(self):
         for key, w in self.f.items():
@@ -294,6 +329,45 @@ class MainWindow(QtWidgets.QMainWindow):
         k = self.f["k_frames"].value()
         self.k_warn.setText(f"K = {k} < 16: covariance estimate is noisy" if k < 16 else "")
 
+    def _apply_display(self):
+        self._read_fields()
+        self.p_spec.setYRange(self.s.spectrum_floor_db, 2, padding=0)
+        self.p_rng.setYRange(self.s.range_floor_dbfs, 0, padding=0.02)
+        self.roi_label.setText(", ".join(str(int(v)) for v in self.s.camera_roi)
+                               if self._roi_valid() else "full frame")
+        self._seen.update(proc=0, board=0, cam=0)     # redraw the latest results with the new limits
+
+    def _roi_valid(self):
+        r = self.s.camera_roi
+        return isinstance(r, (list, tuple)) and len(r) == 4 and r[2] >= 8 and r[3] >= 8
+
+    def _edit_roi(self, on):
+        """Edit mode shows the full frame with a draggable rectangle; leaving it stores the ROI."""
+        if on:
+            w, h = (self._cam_full_shape or (self.s.camera_height, self.s.camera_width))[1::-1]
+            x0, y0, rw, rh = self.s.camera_roi if self._roi_valid() else (w // 4, h // 4, w // 2, h // 2)
+            self.cam_roi = pg.RectROI((x0, y0), (rw, rh), pen=pg.mkPen("y", width=2),
+                                      maxBounds=QtCore.QRectF(0, 0, w, h))
+            self.p_cam.addItem(self.cam_roi)
+            self.btn_roi.setText("Apply camera ROI")
+        else:
+            if self.cam_roi is not None:
+                (x, y), (rw, rh) = self.cam_roi.pos(), self.cam_roi.size()
+                self.s.camera_roi = [int(round(x)), int(round(y)), int(round(rw)), int(round(rh))]
+                self.p_cam.removeItem(self.cam_roi)
+                self.cam_roi = None
+                self.f["camera_roi_enabled"].setChecked(True)
+            self.btn_roi.setText("Edit camera ROI")
+            self._apply_display()
+
+    def _crop_camera(self, frame):
+        if self.cam_roi is not None or not self.s.camera_roi_enabled or not self._roi_valid():
+            return frame
+        x, y, w, h = (int(v) for v in self.s.camera_roi)
+        H, W = frame.shape[:2]
+        x, y = min(max(x, 0), W - 1), min(max(y, 0), H - 1)
+        return frame[y:min(y + h, H), x:min(x + w, W)]
+
     def _radar_changed(self):
         if self.cfg is not None:
             self._on_status("radar parameters changed: press Configure to apply")
@@ -305,7 +379,79 @@ class MainWindow(QtWidgets.QMainWindow):
                            k_frames=self.s.k_frames, fb_averaging=self.s.fb_averaging,
                            diag_loading=self.s.diag_loading, dc_guard_bins=self.s.dc_guard_bins,
                            tdm_phase_comp=self.s.tdm_phase_comp, ddm_tx2_sign=self.s.ddm_tx2_sign,
-                           flip_array=self.s.flip_array, calibration=self.calibration)
+                           flip_array=self.s.flip_array, calibration=self.calibration,
+                           fixed_range_m=self.s.range_gate_m if self.s.range_gate_locked else None)
+
+    def _lock_current(self):
+        res, _ = self.pipeline.latest_proc.get()
+        if res is None:
+            self._on_status("no frame processed yet: nothing to lock")
+            return
+        for key, val in (("range_gate_m", res.target_range_m), ("range_gate_locked", True)):
+            w = self.f[key]
+            w.blockSignals(True)
+            w.setValue(val) if key == "range_gate_m" else w.setChecked(val)
+            w.blockSignals(False)
+        self._apply_processing()
+        self._on_status(f"range gate locked at {res.target_range_m:.2f} m (bin {res.target_bin})")
+
+    # ------------------------------------------------------------------ GUI video recording
+    def _grab_blanked(self):
+        """Window image (BGR uint8) with the camera panel painted over: camera frames never reach a file."""
+        img = self.grab().toImage().convertToFormat(QtGui.QImage.Format_RGB888)
+        poly = self.canvas.mapFromScene(self.p_cam.vb.sceneBoundingRect())
+        rect = poly.boundingRect().adjusted(-2, -2, 2, 2)
+        rect.moveTopLeft(self.canvas.viewport().mapTo(self, rect.topLeft()))
+        painter = QtGui.QPainter(img)                  # logical coordinates (honours devicePixelRatio)
+        painter.fillRect(rect, QtGui.QColor(0, 0, 0))
+        painter.setPen(QtGui.QColor(200, 200, 200))
+        painter.drawText(rect, QtCore.Qt.AlignCenter, "camera not recorded")
+        painter.end()
+        a = np.frombuffer(img.constBits(), np.uint8).reshape(img.height(), img.bytesPerLine())
+        return np.ascontiguousarray(a[:, :img.width() * 3].reshape(img.height(), img.width(), 3)[:, :, ::-1])
+
+    def _toggle_recording(self, on):
+        if on:
+            folder = ROOT / "recordings"
+            folder.mkdir(exist_ok=True)
+            self._rec_stem = folder / time.strftime("gui_%Y%m%d_%H%M%S")
+            try:
+                frame = self._grab_blanked()
+                self.recorder = VideoRecorder(self._rec_stem.with_suffix(".mp4"), self.s.video_fps,
+                                              frame.shape[1], frame.shape[0])
+            except Exception as e:  # noqa: BLE001
+                log.exception("cannot start recording")
+                self._on_status(f"recording failed: {e}")
+                self.btn_rec.blockSignals(True)
+                self.btn_rec.setChecked(False)
+                self.btn_rec.blockSignals(False)
+                return
+            self.recorder.add(frame)
+            self.rec_timer.start(int(1000 / max(1, self.s.video_fps)))
+            self._on_status(f"recording GUI video to {self.recorder.path}")
+        else:
+            self.rec_timer.stop()
+            rec, self.recorder = self.recorder, None
+            if rec is not None:
+                self._update_report()
+                self._rec_stem.with_suffix(".txt").write_text(self.report.toPlainText(), encoding="utf-8")
+                rec.close()
+                self._on_status(f"video saved: {rec.path} ({rec.written} frames, {rec.duration_s:.1f} s, "
+                                f"{rec.dropped} grabs dropped)")
+        self._update_rec_button()
+
+    def _record_frame(self):
+        if self.recorder is not None:
+            self.recorder.add(self._grab_blanked())
+
+    def _update_rec_button(self):
+        if self.recorder is None:
+            self.btn_rec.setText("Record GUI video")
+            self.btn_rec.setStyleSheet("")
+        else:
+            t = int(self.recorder.duration_s)
+            self.btn_rec.setText(f"Stop recording ({t // 60:02d}:{t % 60:02d})")
+            self.btn_rec.setStyleSheet("color: #c0392b; font-weight: bold")
 
     def _apply_processing(self):
         self._read_fields()
@@ -463,7 +609,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.p_ra.setXRange(-90, 90, padding=0)
         self.p_ra.setYRange(0, d, padding=0)
         self.p_rng.setXRange(0, d, padding=0.02)
-        self.p_rng.setYRange(-60, 2)
+        self.p_rng.setYRange(self.s.range_floor_dbfs, 0, padding=0.02)
 
     def _draw(self):
         if not self.pipeline.acquiring and "Stop" in self.btn_run.text():
@@ -485,7 +631,8 @@ class MainWindow(QtWidgets.QMainWindow):
             for name, curve in self.curves.items():
                 p = np.asarray(out["spectra"][name], dtype=float)
                 if np.all(np.isfinite(p)) and p.max() > 0:
-                    curve.setData(THETA_DEG, np.maximum(10 * np.log10(np.maximum(p / p.max(), 1e-12)), DB_FLOOR))
+                    curve.setData(THETA_DEG, np.maximum(10 * np.log10(np.maximum(p / p.max(), 1e-30)),
+                                                        self.s.spectrum_floor_db))
                 else:
                     curve.setData([], [])
             k = out.get("k", 2)
@@ -502,7 +649,12 @@ class MainWindow(QtWidgets.QMainWindow):
         frame, seq = self.camera.latest.get()
         if frame is not None and seq != self._seen["cam"]:
             self._seen["cam"] = seq
+            self._cam_full_shape = frame.shape[:2]
+            frame = self._crop_camera(frame)
             self.img_cam.setImage(frame, autoLevels=False, levels=(0, 255))
+            if frame.shape[:2] != self._cam_shape:          # ROI or resolution changed: refit the view
+                self._cam_shape = frame.shape[:2]
+                self.p_cam.autoRange(padding=0)
             self.cam_text.setVisible(False)
         elif frame is None:
             self.cam_text.setText(self.camera.status)
@@ -523,6 +675,13 @@ class MainWindow(QtWidgets.QMainWindow):
                                                          f"({1 / self.budget.frame_period_s:.1f} fps); reconfigure to apply measured values"))
         lines = [("" if self.cfg else "(not configured, preview)")]
         lines += [f"{k:30s} {v}" for k, v in rows]
+        if cfg.ok and self.s.range_gate_locked:
+            b = self.pipeline.processor.fixed_bin if self.pipeline.processor is not None else None
+            lines.append(f"{'Range gate':30s} LOCKED at {self.s.range_gate_m:.2f} m"
+                         + ("" if b is None else f" (bin {b}, {b * cfg.range_bin_m:.2f} m)"))
+        elif cfg.ok:
+            lines.append(f"{'Target search range':30s} {self.s.dc_guard_bins * cfg.range_bin_m:.2f} .. "
+                         f"{cfg.display_range_m:.2f} m (bins >= {self.s.dc_guard_bins})")
 
         def ms(x):
             return "-" if x is None else f"{x * 1e3:.2f} ms"
@@ -550,6 +709,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.camera.measured_fps.rate:
             lines.append(f"{'  camera':30s} {self.camera.measured_fps.rate:.1f} fps")
         self.report.setPlainText("\n".join(lines))
+        if self.recorder is not None:
+            self._update_rec_button()
         self.st["camera"].setText(self.camera.status)
         self.st["board"].setText("board: " + (getattr(self.board, "state", None) or
                                               (self.board.name if self.board else "-")))
@@ -578,8 +739,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.s.save()
         except OSError:
             log.exception("cannot save settings")
+        if self.recorder is not None:
+            self.btn_rec.setChecked(False)         # finishes and closes the video file
         self.timer.stop()
-        self.pipeline.shutdown()               # stops the source (radar: StopFrame + DCA1000 stop)
+        self.pipeline.shutdown()              # stops the source (radar: StopFrame + DCA1000 stop)
         for obj in (self.radar, self.board):
             if obj is not None:
                 try:

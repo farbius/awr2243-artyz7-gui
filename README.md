@@ -99,7 +99,17 @@ which is not shipped from this folder.
 4. **Start streaming** or **Single frame**. *Radar frames per run* (0 = continuous) limits a
    run to a finite number of frames. The first radar transmit of a session asks for confirmation.
 5. Processing fields (K, number of sources, snapshots, FB averaging, diagonal loading, clutter
-   removal, flip array, IP-core latency) apply immediately.
+   removal, flip array, IP-core latency, DC guard) apply immediately. So do the display fields:
+   the lower limit of the spectra plot (dB) and of the range profile (dBFS), and the camera ROI.
+   *Edit camera ROI* shows the full frame with a rectangle to drag and resize; pressing the
+   button again stores it and turns the crop on.
+   *Lock range gate* fixes the covariance range bin at *Gate range [m]* instead of searching
+   for the strongest bin. *Lock at current target* locks it to the bin of the latest frame.
+   With the gate locked, the covariance window is never restarted by target jumps.
+   *Record GUI video* records the window to `recordings/gui_<time>.mp4` (mp4v, `video_fps` =
+   10 in the settings JSON, real-time speed) until pressed again, and writes the final report
+   as `.txt`. Every frame has the camera panel painted black before it is written, because
+   camera frames are never stored. Closing the window finishes the file.
 6. Closing the window stops everything: StopFrame and the DCA1000 stop, the board server
    (which releases the UIO devices and buffers), and the camera. The settings are saved to JSON.
 
@@ -167,8 +177,13 @@ model is a[n] = exp(+jπ n sin θ), the same as the IP cores.
 
 ## Processing and covariance
 
-- **Range:** Hann window, FFT over N samples. Bins below *dc_guard_bins* (3) are excluded from
-  the target search, and the display is limited to *Max display range*.
+- **Range:** Hann window, FFT over N samples. Bins below *Min target bin (DC guard)* (default 3,
+  GUI field) are excluded from the target search, and the display is limited to *Max display
+  range*. The report shows the resulting search window in metres.
+- **Range profile plot:** the middle chirp of the frame per RX, before clutter removal and
+  calibration, in dBFS: 0 dBFS is a full-scale complex tone of the 16-bit ADC (I and Q
+  amplitude 2^15), with the Hann coherent gain removed. The noise floor therefore lies below
+  the per-sample ADC noise by the FFT processing gain.
 - **Range-azimuth map:** FFT beamforming over the 8 virtual channels (64-point, mapped to
   −90..90°), non-coherently averaged over loops.
 - **Target cell:** the range bin with the most energy, then the strongest Doppler bin there.

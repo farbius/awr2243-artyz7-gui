@@ -37,6 +37,8 @@ class Settings:
     # (measured 2026-11-06, captures/ddm_20261106_181939.npy).
     ddm_tx2_sign: int = -1
     dc_guard_bins: int = 3
+    range_gate_locked: bool = False      # True: covariance always from the bin at range_gate_m
+    range_gate_m: float = 1.5
     calibration_path: str = str(REPO / "datasets" / "awr2243_calibration.npz")
     ip_latency_us: float = 500.0
     # sources
@@ -60,6 +62,12 @@ class Settings:
     camera_width: int = 640
     camera_height: int = 480
     camera_fps: int = 30
+    camera_roi_enabled: bool = False
+    camera_roi: list = field(default_factory=lambda: [0, 0, 0, 0])   # x, y, w, h in camera pixels
+    # display (applied immediately)
+    spectrum_floor_db: float = -50.0     # lower limit of the azimuth spectra plot
+    range_floor_dbfs: float = -120.0     # lower limit of the range profile plot
+    video_fps: int = 10                  # GUI video recording frame rate
     # simulation targets: [range_m, azimuth_deg, velocity_mps, snr_db]
     sim_targets: list = field(default_factory=lambda: [[6.0, -20.0, 0.0, 0.0], [6.0, 30.0, 0.0, -3.0]])
 
